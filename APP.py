@@ -8,6 +8,47 @@ import streamlit as st
 from pypdf import PdfReader, PdfWriter
 import pdfplumber
 
+import unicodedata
+import pandas as pd
+
+def normalize_text(s: str) -> str:
+    s = s or ""
+    s = s.replace("\u00A0", " ")
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+def clean_title_prefixes(name: str) -> str:
+    # quita títulos al inicio: DR., DRA., LIC., ING., MSC., MÁSTER, PHD, etc.
+    if not name:
+        return name
+    pattern = r"^\s*(?:dr\.?|dra\.?|lic\.?|ing\.?|msc\.?|m\.?sc\.?|maestr[eo]|master|mag\.?|mtr\.?|ph\.?d\.?|prof\.?)\s+"
+    name = re.sub(pattern, "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+# Busca "NOMBRE DEL PROFESOR(A): ..." en las primeras páginas del rango
+def find_prof_name_in_section(pdf_bytes: bytes, start_page: int, end_page: int,
+                              scan_pages: int = 2, lines_per_page: int = 50) -> str | None:
+    label_rx = re.compile(
+        r"^\s*NOMBRE\s+DEL\s+PROFESOR\(A\)\s*[:=\-\u2014\u2013]\s*(.+)$",
+        re.IGNORECASE
+    )
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        stop = min(end_page, start_page + scan_pages)
+        for p in range(start_page, stop):
+            txt = pdf.pages[p].extract_text() or ""
+            lines = txt.splitlines()[:lines_per_page]
+            for raw in lines:
+                m = label_rx.search(raw)
+                if m and m.group(1).strip():
+                    val = m.group(1).strip()
+                    val = clean_title_prefixes(val)
+                    val = sanitize_filename(val)
+                    if val:
+                        return val
+    return None
 
 # ========= Utilidades =========
 def sanitize_filename(name: str, max_len: int = 80) -> str:
@@ -58,21 +99,72 @@ def export_ranges_to_zip(
     ranges: List[Tuple[int, int, str]],
     prefix: str = "",
 ) -> bytes:
-    """Crea un ZIP con cada rango (start, end, label)."""
+    """
+    Crea un ZIP con cada rango (start, end). Para el nombre del archivo:
+      1) Busca 'NOMBRE DEL PROFESOR(A): ...' dentro del rango (1–2 páginas)
+      2) Si no lo encuentra, usa 'label' del rango (si lo hubiera)
+      3) Si nada, 'Plan_###'
+    Además, genera un Excel (detalles/resumen) y lo mete al ZIP.
+    """
     reader = PdfReader(io.BytesIO(pdf_bytes))
     mem_zip = io.BytesIO()
+
+    detalles_rows = []
+
     with zipfile.ZipFile(mem_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for idx, (start, end, label) in enumerate(ranges, 1):
+            # 1) Intentar detectar el nombre exacto por etiqueta
+            detected = find_prof_name_in_section(
+                pdf_bytes, start, end, scan_pages=2, lines_per_page=60
+            )
+
+            # 2) Si no se detectó, caer al label de inicio
+            if not detected:
+                detected = sanitize_filename(label) if label else None
+
+            # 3) Fallback final
+            if not detected:
+                detected = f"Plan_{idx:03d}"
+
+            # Exportar el rango a PDF
             writer = PdfWriter()
             for p in range(start, end):
                 writer.add_page(reader.pages[p])
             out_bytes = io.BytesIO()
             writer.write(out_bytes)
             out_bytes.seek(0)
-            fname = f"{prefix}{idx:03d}_{sanitize_filename(label)}.pdf"
+
+            fname = f"{prefix}{idx:03d}_{sanitize_filename(detected)}.pdf"
             zf.writestr(fname, out_bytes.read())
+
+            # fila para el reporte
+            detalles_rows.append({
+                "orden": idx,
+                "archivo": fname,
+                "nombre_detectado": detected,
+                "pagina_inicio_1based": start + 1,
+                "pagina_fin_1based": end,
+                "paginas_en_pdf": end - start
+            })
+
+        # ==== Excel de reporte (detalles y resumen) ====
+        detalles_df = pd.DataFrame(detalles_rows)
+        resumen_df = (detalles_df.groupby("nombre_detectado", dropna=False)
+                      .size().reset_index(name="cantidad_pdfs")
+                      .sort_values(["cantidad_pdfs", "nombre_detectado"], ascending=[False, True]))
+
+        excel_bytes = io.BytesIO()
+        with pd.ExcelWriter(excel_bytes, engine="openpyxl") as writer:
+            detalles_df.to_excel(writer, index=False, sheet_name="detalles")
+            resumen_df.to_excel(writer, index=False, sheet_name="resumen")
+        excel_bytes.seek(0)
+
+        # incluir el Excel dentro del ZIP
+        zf.writestr("reporte_division.xlsx", excel_bytes.getvalue())
+
     mem_zip.seek(0)
     return mem_zip.getvalue()
+
 
 
 def build_ranges_from_starts(
