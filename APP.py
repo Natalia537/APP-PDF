@@ -34,6 +34,13 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
+# corta un texto ANTES de la palabra GÉNERO/GENERO (insensible a mayúsculas/acentos)
+def cut_before_genero(s: str) -> str:
+    if not s:
+        return s
+    parts = re.split(r"\bG[EÉ]NERO\b", s, flags=re.IGNORECASE, maxsplit=1)
+    return parts[0].strip() if parts else s.strip()
+
 # ============ Extracción de textos ============
 def get_page_texts_for_start(pdf_bytes: bytes, max_lines: int) -> List[str]:
     """Texto por página (solo primeras max_lines) para detectar INICIO."""
@@ -72,17 +79,18 @@ def detect_starts_by_patterns(page_texts: List[str], patterns: List[str]) -> Lis
         found_label = None
         for rx in regexes:
             # buscar por líneas para que ^ y $ sean útiles
+            matched = False
             for line in txt.split("\n"):
                 m = rx.search(line)
                 if m:
+                    matched = True
                     if m.lastindex:
                         cand = sanitize_filename(m.group(1))
                         found_label = cand or None
                     else:
                         found_label = None
                     break
-            if found_label is not None or m:
-                # Se detectó un inicio (con o sin captura)
+            if matched:
                 starts.append((i, found_label))
                 break
     return starts
@@ -109,9 +117,9 @@ def find_prof_name_in_section(pdf_bytes: bytes, start_page: int, end_page: int,
     """
     Busca EXACTAMENTE la línea: NOMBRE DEL PROFESOR(A) : <valor>
     Acepta separadores :  -  –  —  =
+    Corta el valor antes de la palabra GÉNERO/GENERO si aparece en la misma línea.
     Devuelve <valor> limpio (sin títulos), o None si no lo encuentra.
     """
-    # regex robusto (ignora espacios extra y variantes de separador)
     label_rx = re.compile(
         r"^\s*NOMBRE\s+DEL\s+PROFESOR\(A\)\s*[:=\-\u2014\u2013]\s*(.+)$",
         re.IGNORECASE
@@ -121,11 +129,12 @@ def find_prof_name_in_section(pdf_bytes: bytes, start_page: int, end_page: int,
         stop = min(end_page, start_page + scan_pages)
         for p in range(start_page, stop):
             txt = pdf.pages[p].extract_text() or ""
-            # Escanear bastantes líneas por si la etiqueta no está en la primera línea
             for raw in (txt.splitlines()[:lines_per_page]):
                 m = label_rx.search(raw)
                 if m and m.group(1).strip():
                     name = m.group(1).strip()
+                    # cortar antes de "GÉNERO" si viene en la misma línea
+                    name = cut_before_genero(name)
                     name = clean_title_prefixes(name)
                     name = sanitize_filename(name)
                     return name if name else None
@@ -136,32 +145,25 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
 def build_excel_bytes(detalles_rows: List[dict]) -> bytes:
-    """
-    Crea un Excel con hojas 'detalles' y 'resumen' usando openpyxl (sin pandas/numpy).
-    """
+    """Crea un Excel con hojas 'detalles' y 'resumen' usando openpyxl (sin pandas/numpy)."""
     wb = Workbook()
     ws_det = wb.active
     ws_det.title = "detalles"
 
-    # Esquema detalles
     headers = ["orden", "archivo", "nombre_detectado", "pagina_inicio_1based", "pagina_fin_1based", "paginas_en_pdf"]
     ws_det.append(headers)
     for row in detalles_rows:
         ws_det.append([row.get(h) for h in headers])
 
-    # Auto-ajuste simple de anchos
     for col_idx, h in enumerate(headers, 1):
         ws_det.column_dimensions[get_column_letter(col_idx)].width = max(16, len(h) + 2)
 
-    # Resumen
     ws_res = wb.create_sheet("resumen")
     ws_res.append(["nombre_detectado", "cantidad_pdfs"])
-    # conteo
     counts = {}
     for r in detalles_rows:
         key = r.get("nombre_detectado") or ""
         counts[key] = counts.get(key, 0) + 1
-    # Ordenado por cantidad desc, luego nombre asc
     for name, qty in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
         ws_res.append([name, qty])
     ws_res.column_dimensions["A"].width = 40
@@ -183,10 +185,13 @@ def export_zip_and_excel(
     """
     Devuelve (zip_bytes, excel_bytes, detalles_rows).
     El ZIP trae todos los PDFs nombrados; el Excel trae detalles y resumen.
+    - SIN numeración al inicio del nombre del archivo.
+    - Si hay colisión de nombres, agrega sufijo _(2), _(3)...
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
     detalles_rows = []
     mem_zip = io.BytesIO()
+    used_names: dict[str, int] = {}
 
     with zipfile.ZipFile(mem_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for idx, (start, end, label_opt) in enumerate(ranges, 1):
@@ -201,6 +206,16 @@ def export_zip_and_excel(
             if not detected:
                 detected = f"Plan_{idx:03d}"
 
+            base = sanitize_filename(f"{prefix}{detected}") if prefix else sanitize_filename(detected)
+
+            # Unicidad: si ya existe, agrega sufijo _(2), _(3)...
+            final_name = base
+            if final_name in used_names:
+                used_names[final_name] += 1
+                final_name = f"{base}_({used_names[base]})"
+            else:
+                used_names[final_name] = 1
+
             # Escribir el sub-PDF
             writer = PdfWriter()
             for p in range(start, end):
@@ -209,7 +224,7 @@ def export_zip_and_excel(
             writer.write(out_bytes)
             out_bytes.seek(0)
 
-            fname = f"{prefix}{idx:03d}_{sanitize_filename(detected)}.pdf"
+            fname = f"{final_name}.pdf"  # <-- sin numeración
             zf.writestr(fname, out_bytes.read())
 
             # Registro para Excel
@@ -229,7 +244,7 @@ def export_zip_and_excel(
 # ============ UI ============
 st.set_page_config(page_title="PDF Splitter — Profes y Excel", page_icon="📄")
 st.title("📄 Dividir PDF, nombrar por 'NOMBRE DEL PROFESOR(A):' y generar Excel")
-st.caption("Compatibilidad Streamlit Cloud: sin pandas/numpy. Usa openpyxl para el reporte.")
+st.caption("Corta nombres antes de 'GÉNERO'. Sin numeración en el nombre del archivo.")
 
 with st.sidebar:
     st.header("⚙️ Configuración")
@@ -237,7 +252,7 @@ with st.sidebar:
 
     # Patrones para detectar inicio de cada “plan”
     default_patterns = "\n".join([
-        r"^\s*plan\s+de\s+clase",              # ejemplo de encabezado común
+        r"^\s*plan\s+de\s+clase",              # ejemplo
         r"^\s*profesor(?:a)?\s*:\s*(.+)$",     # si justo aquí aparece un nombre
         r"^\s*docente\s*:\s*(.+)$"
     ])
@@ -258,7 +273,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("📛 Búsqueda del nombre")
-    st.write("Se buscará **exactamente** la línea `NOMBRE DEL PROFESOR(A): ...` en las primeras páginas de cada sección.")
+    st.write("Se busca **exactamente** la línea `NOMBRE DEL PROFESOR(A): ...` en las primeras páginas de cada sección y se corta antes de 'GÉNERO'.")
     scan_pages = st.number_input("Páginas a escanear por sección", 1, 10, 2, 1)
     lines_for_name = st.number_input("Líneas a leer por página (para nombre)", 5, 120, 60, 5)
 
@@ -317,7 +332,7 @@ if file is not None:
         else:
             ranges = build_ranges_every_n(total_pages, n_pages)
 
-        # Exportar ZIP y Excel
+        # Exportar ZIP y Excel (sin numeración en archivo, y cortando antes de GÉNERO)
         zip_bytes, excel_bytes, detalles_rows = export_zip_and_excel(
             pdf_bytes, ranges, prefix=prefix,
             scan_pages=scan_pages, lines_per_page=lines_for_name
@@ -338,12 +353,11 @@ if file is not None:
         )
 
 st.markdown("---")
-with st.expander("❓ Consejos si no encuentra el nombre"):
+with st.expander("❓ Tips"):
     st.markdown(
         """
-- Aumenta **“Páginas a escanear”** a 3–4 y **“Líneas a leer por página (para nombre)”** a 80–100.
-- Verifica que **literalmente** exista la línea: `NOMBRE DEL PROFESOR(A): Juan Pérez` en la primera página del plan.
-- Si el PDF es escaneado (imágenes), necesitas hacer **OCR** local antes de subirlo.
-- Si tu encabezado de inicio no tiene un patrón claro, usa el modo **“Cada N páginas”** y deja el nombre al detector.
+- Si el nombre aparece más abajo, sube **“Páginas a escanear”** (3–4) o **“Líneas para nombre”** (80–100).
+- Acepta `GÉNERO` o `GENERO` con o sin acento, mayús/minús.
+- Si hay nombres repetidos, el ZIP agrega `_(2)`, `_(3)` para no sobrescribir.
 """
     )
