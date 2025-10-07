@@ -1,12 +1,16 @@
-# PDF Splitter por Criterios (Streamlit)
+# PDF Splitter (Profes + Excel)
 
-App en Streamlit para dividir un PDF grande:
-- **Por patrones de texto** (ej. `Profesor: Nombre`)
-- **Cada N páginas** (rápido)
+Divide un PDF grande en secciones y nombra cada PDF con el valor que sigue a:
+**NOMBRE DEL PROFESOR(A): ...**
 
-## Uso local
-```bash
-python -m venv .venv
-source .venv/bin/activate   # en Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py
+- Soporta separadores `:`, `-`, `–`, `—`, `=`
+- Limpia prefijos (DR., DRA., LIC., ING., MSC., MAG., MTR., PHD, PROF., etc.)
+- Genera `reporte.xlsx` con hojas `detalles` y `resumen` (openpyxl)
+- Liviano para Streamlit Cloud (no usa pandas/numpy)
+
+## Despliegue
+1. Asegura `APP.py` como Main file (coincide con tu despliegue).
+2. `requirements.txt` y `runtime.txt` como en el repo.
+3. Si se queda en "Your app is in the oven", revisa logs y confirma estas versiones.
+
+## Local
