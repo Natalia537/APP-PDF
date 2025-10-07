@@ -1,6 +1,7 @@
-import re
 import io
+import re
 import zipfile
+import unicodedata
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -8,10 +9,24 @@ import streamlit as st
 from pypdf import PdfReader, PdfWriter
 import pdfplumber
 
-import unicodedata
-import pandas as pd
+# ============ Utilidades de texto / limpieza ============
+def sanitize_filename(name: str, max_len: int = 100) -> str:
+    name = re.sub(r"[^\w\s\-_.()]", "", name, flags=re.UNICODE).strip()
+    name = re.sub(r"\s+", " ", name)
+    name = name[:max_len] or "Plan"
+    return name
+
+def clean_title_prefixes(name: str) -> str:
+    """Quita títulos comunes al inicio (DR., DRA., LIC., ING., MSC., MAG., MTR., PHD, PROF., etc.)."""
+    if not name:
+        return name
+    pattern = r"^\s*(?:dr\.?|dra\.?|lic\.?|ing\.?|msc\.?|m\.?sc\.?|mag\.?|maestr[eo]|master|mtr\.?|ph\.?d\.?|prof\.?)\s+"
+    name = re.sub(pattern, "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
 
 def normalize_text(s: str) -> str:
+    """Normaliza: sin tildes, minúsculas y espacios colapsados (para comparar)."""
     s = s or ""
     s = s.replace("\u00A0", " ")
     s = unicodedata.normalize("NFD", s)
@@ -19,114 +34,174 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
-def clean_title_prefixes(name: str) -> str:
-    # quita títulos al inicio: DR., DRA., LIC., ING., MSC., MÁSTER, PHD, etc.
-    if not name:
-        return name
-    pattern = r"^\s*(?:dr\.?|dra\.?|lic\.?|ing\.?|msc\.?|m\.?sc\.?|maestr[eo]|master|mag\.?|mtr\.?|ph\.?d\.?|prof\.?)\s+"
-    name = re.sub(pattern, "", name, flags=re.IGNORECASE)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name
-
-# Busca "NOMBRE DEL PROFESOR(A): ..." en las primeras páginas del rango
-def find_prof_name_in_section(pdf_bytes: bytes, start_page: int, end_page: int,
-                              scan_pages: int = 2, lines_per_page: int = 50) -> str | None:
-    label_rx = re.compile(
-        r"^\s*NOMBRE\s+DEL\s+PROFESOR\(A\)\s*[:=\-\u2014\u2013]\s*(.+)$",
-        re.IGNORECASE
-    )
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        stop = min(end_page, start_page + scan_pages)
-        for p in range(start_page, stop):
-            txt = pdf.pages[p].extract_text() or ""
-            lines = txt.splitlines()[:lines_per_page]
-            for raw in lines:
-                m = label_rx.search(raw)
-                if m and m.group(1).strip():
-                    val = m.group(1).strip()
-                    val = clean_title_prefixes(val)
-                    val = sanitize_filename(val)
-                    if val:
-                        return val
-    return None
-
-# ========= Utilidades =========
-def sanitize_filename(name: str, max_len: int = 80) -> str:
-    name = re.sub(r"[^\w\s\-_.()]", "", name, flags=re.UNICODE).strip()
-    name = re.sub(r"\s+", " ", name)
-    return name[:max_len] or "Plan"
-
-
-def detect_starts_by_patterns(
-    page_texts: List[str],
-    patterns: List[str],
-) -> List[Tuple[int, str]]:
-    """Devuelve lista de (page_index, label) donde se detecta inicio."""
-    regexes = [re.compile(pat, re.IGNORECASE) for pat in patterns]
-    starts = []
-    for i, txt in enumerate(page_texts):
-        label = None
-        for rx in regexes:
-            m = rx.search(txt)
-            if m:
-                if m.lastindex:  # si hay grupo capturado, úsalo para nombrar
-                    cand = sanitize_filename(m.group(1))
-                    label = cand or "Plan"
-                else:
-                    label = "Plan"
-                break
-        if label:
-            starts.append((i, label))
-    return starts
-
-
-def get_page_texts(
-    pdf_bytes: bytes,
-    header_lines: int = 8,
-) -> List[str]:
-    """Extrae texto por página (sólo primeras N líneas para robustez)."""
+# ============ Extracción de textos ============
+def get_page_texts_for_start(pdf_bytes: bytes, max_lines: int) -> List[str]:
+    """Texto por página (solo primeras max_lines) para detectar INICIO."""
     texts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             txt = page.extract_text() or ""
             lines = txt.splitlines()
-            texts.append("\n".join(lines[: header_lines if header_lines > 0 else len(lines)]))
+            take = lines if max_lines <= 0 else lines[:max_lines]
+            texts.append("\n".join(take))
     return texts
 
+def get_text_block_for_name(pdf_bytes: bytes, start_page: int, end_page: int,
+                            scan_pages: int, max_lines_per_page: int) -> str:
+    """Concatena las primeras max_lines de las primeras scan_pages páginas del rango."""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        stop = min(end_page, start_page + scan_pages)
+        buf = []
+        for p in range(start_page, stop):
+            txt = pdf.pages[p].extract_text() or ""
+            lines = txt.splitlines()
+            take = lines if max_lines_per_page <= 0 else lines[:max_lines_per_page]
+            buf.extend(take)
+    return "\n".join(buf)
 
-def export_ranges_to_zip(
-    pdf_bytes: bytes,
-    ranges: List[Tuple[int, int, str]],
-    prefix: str = "",
-) -> bytes:
+# ============ Detección de inicios ============
+def detect_starts_by_patterns(page_texts: List[str], patterns: List[str]) -> List[Tuple[int, Optional[str]]]:
     """
-    Crea un ZIP con cada rango (start, end). Para el nombre del archivo:
-      1) Busca 'NOMBRE DEL PROFESOR(A): ...' dentro del rango (1–2 páginas)
-      2) Si no lo encuentra, usa 'label' del rango (si lo hubiera)
-      3) Si nada, 'Plan_###'
-    Además, genera un Excel (detalles/resumen) y lo mete al ZIP.
+    Devuelve lista de (page_index, etiqueta_capturada_o_None).
+    Los patrones pueden tener (.+) para capturar un valor.
+    Se evalúa línea por línea.
+    """
+    regexes = [re.compile(pat, re.IGNORECASE) for pat in patterns]
+    starts = []
+    for i, txt in enumerate(page_texts):
+        found_label = None
+        for rx in regexes:
+            # buscar por líneas para que ^ y $ sean útiles
+            for line in txt.split("\n"):
+                m = rx.search(line)
+                if m:
+                    if m.lastindex:
+                        cand = sanitize_filename(m.group(1))
+                        found_label = cand or None
+                    else:
+                        found_label = None
+                    break
+            if found_label is not None or m:
+                # Se detectó un inicio (con o sin captura)
+                starts.append((i, found_label))
+                break
+    return starts
+
+def build_ranges_from_starts(total_pages: int, starts: List[Tuple[int, Optional[str]]]) -> List[Tuple[int, int, Optional[str]]]:
+    ranges = []
+    for k, (p_ini, label_opt) in enumerate(starts):
+        p_fin = starts[k + 1][0] if k + 1 < len(starts) else total_pages
+        ranges.append((p_ini, p_fin, label_opt))
+    return ranges
+
+def build_ranges_every_n(total_pages: int, n: int) -> List[Tuple[int, int, Optional[str]]]:
+    ranges = []
+    i = 0
+    while i < total_pages:
+        end = min(i + n, total_pages)
+        ranges.append((i, end, None))
+        i = end
+    return ranges
+
+# ============ Búsqueda específica del nombre ============
+def find_prof_name_in_section(pdf_bytes: bytes, start_page: int, end_page: int,
+                              scan_pages: int = 2, lines_per_page: int = 60) -> Optional[str]:
+    """
+    Busca EXACTAMENTE la línea: NOMBRE DEL PROFESOR(A) : <valor>
+    Acepta separadores :  -  –  —  =
+    Devuelve <valor> limpio (sin títulos), o None si no lo encuentra.
+    """
+    # regex robusto (ignora espacios extra y variantes de separador)
+    label_rx = re.compile(
+        r"^\s*NOMBRE\s+DEL\s+PROFESOR\(A\)\s*[:=\-\u2014\u2013]\s*(.+)$",
+        re.IGNORECASE
+    )
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        stop = min(end_page, start_page + scan_pages)
+        for p in range(start_page, stop):
+            txt = pdf.pages[p].extract_text() or ""
+            # Escanear bastantes líneas por si la etiqueta no está en la primera línea
+            for raw in (txt.splitlines()[:lines_per_page]):
+                m = label_rx.search(raw)
+                if m and m.group(1).strip():
+                    name = m.group(1).strip()
+                    name = clean_title_prefixes(name)
+                    name = sanitize_filename(name)
+                    return name if name else None
+    return None
+
+# ============ Excel (openpyxl) ============
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
+def build_excel_bytes(detalles_rows: List[dict]) -> bytes:
+    """
+    Crea un Excel con hojas 'detalles' y 'resumen' usando openpyxl (sin pandas/numpy).
+    """
+    wb = Workbook()
+    ws_det = wb.active
+    ws_det.title = "detalles"
+
+    # Esquema detalles
+    headers = ["orden", "archivo", "nombre_detectado", "pagina_inicio_1based", "pagina_fin_1based", "paginas_en_pdf"]
+    ws_det.append(headers)
+    for row in detalles_rows:
+        ws_det.append([row.get(h) for h in headers])
+
+    # Auto-ajuste simple de anchos
+    for col_idx, h in enumerate(headers, 1):
+        ws_det.column_dimensions[get_column_letter(col_idx)].width = max(16, len(h) + 2)
+
+    # Resumen
+    ws_res = wb.create_sheet("resumen")
+    ws_res.append(["nombre_detectado", "cantidad_pdfs"])
+    # conteo
+    counts = {}
+    for r in detalles_rows:
+        key = r.get("nombre_detectado") or ""
+        counts[key] = counts.get(key, 0) + 1
+    # Ordenado por cantidad desc, luego nombre asc
+    for name, qty in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+        ws_res.append([name, qty])
+    ws_res.column_dimensions["A"].width = 40
+    ws_res.column_dimensions["B"].width = 16
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+# ============ Export (ZIP + Excel) ============
+def export_zip_and_excel(
+    pdf_bytes: bytes,
+    ranges: List[Tuple[int, int, Optional[str]]],
+    prefix: str,
+    scan_pages: int,
+    lines_per_page: int,
+) -> Tuple[bytes, bytes, List[dict]]:
+    """
+    Devuelve (zip_bytes, excel_bytes, detalles_rows).
+    El ZIP trae todos los PDFs nombrados; el Excel trae detalles y resumen.
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
+    detalles_rows = []
     mem_zip = io.BytesIO()
 
-    detalles_rows = []
-
     with zipfile.ZipFile(mem_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for idx, (start, end, label) in enumerate(ranges, 1):
-            # 1) Intentar detectar el nombre exacto por etiqueta
+        for idx, (start, end, label_opt) in enumerate(ranges, 1):
+            # 1) Intentar con NOMBRE DEL PROFESOR(A):
             detected = find_prof_name_in_section(
-                pdf_bytes, start, end, scan_pages=2, lines_per_page=60
+                pdf_bytes, start, end, scan_pages=scan_pages, lines_per_page=lines_per_page
             )
-
-            # 2) Si no se detectó, caer al label de inicio
-            if not detected:
-                detected = sanitize_filename(label) if label else None
-
+            # 2) Si no, usar etiqueta del inicio si existe
+            if not detected and label_opt:
+                detected = sanitize_filename(label_opt)
             # 3) Fallback final
             if not detected:
                 detected = f"Plan_{idx:03d}"
 
-            # Exportar el rango a PDF
+            # Escribir el sub-PDF
             writer = PdfWriter()
             for p in range(start, end):
                 writer.add_page(reader.pages[p])
@@ -137,99 +212,43 @@ def export_ranges_to_zip(
             fname = f"{prefix}{idx:03d}_{sanitize_filename(detected)}.pdf"
             zf.writestr(fname, out_bytes.read())
 
-            # fila para el reporte
+            # Registro para Excel
             detalles_rows.append({
                 "orden": idx,
                 "archivo": fname,
                 "nombre_detectado": detected,
                 "pagina_inicio_1based": start + 1,
                 "pagina_fin_1based": end,
-                "paginas_en_pdf": end - start
+                "paginas_en_pdf": end - start,
             })
 
-        # ==== Excel de reporte (detalles y resumen) ====
-        detalles_df = pd.DataFrame(detalles_rows)
-        resumen_df = (detalles_df.groupby("nombre_detectado", dropna=False)
-                      .size().reset_index(name="cantidad_pdfs")
-                      .sort_values(["cantidad_pdfs", "nombre_detectado"], ascending=[False, True]))
-
-        excel_bytes = io.BytesIO()
-        with pd.ExcelWriter(excel_bytes, engine="openpyxl") as writer:
-            detalles_df.to_excel(writer, index=False, sheet_name="detalles")
-            resumen_df.to_excel(writer, index=False, sheet_name="resumen")
-        excel_bytes.seek(0)
-
-        # incluir el Excel dentro del ZIP
-        zf.writestr("reporte_division.xlsx", excel_bytes.getvalue())
-
     mem_zip.seek(0)
-    return mem_zip.getvalue()
+    excel_bytes = build_excel_bytes(detalles_rows)
+    return mem_zip.getvalue(), excel_bytes, detalles_rows
 
-
-
-def build_ranges_from_starts(
-    total_pages: int,
-    starts: List[Tuple[int, str]],
-) -> List[Tuple[int, int, str]]:
-    """Convierte inicios (página, etiqueta) a rangos (ini, fin, etiqueta)."""
-    ranges = []
-    for k, (p_ini, label) in enumerate(starts):
-        p_fin = starts[k + 1][0] if k + 1 < len(starts) else total_pages
-        ranges.append((p_ini, p_fin, label or f"Plan_{k+1}"))
-    return ranges
-
-
-def build_ranges_every_n(
-    total_pages: int, n: int
-) -> List[Tuple[int, int, str]]:
-    ranges = []
-    i = 0
-    idx = 0
-    while i < total_pages:
-        idx += 1
-        end = min(i + n, total_pages)
-        ranges.append((i, end, f"Plan_{idx:03d}"))
-        i = end
-    return ranges
-
-
-# ========= UI =========
-st.set_page_config(page_title="PDF Splitter por Criterios (Profes/Planes)", page_icon="📄")
-
-st.title("📄 Dividir PDF por criterios (Profes/Planes)")
-st.caption(
-    "Sube un PDF grande y sepáralo por patrones de texto (ej. 'Profesor: Nombre') "
-    "o cada N páginas. Descarga un ZIP con los PDFs resultantes."
-)
+# ============ UI ============
+st.set_page_config(page_title="PDF Splitter — Profes y Excel", page_icon="📄")
+st.title("📄 Dividir PDF, nombrar por 'NOMBRE DEL PROFESOR(A):' y generar Excel")
+st.caption("Compatibilidad Streamlit Cloud: sin pandas/numpy. Usa openpyxl para el reporte.")
 
 with st.sidebar:
     st.header("⚙️ Configuración")
-    mode = st.radio(
-        "Modo de división",
-        options=["Por patrones de texto", "Cada N páginas"],
-    )
+    mode = st.radio("Modo de división", ["Por patrones de inicio", "Cada N páginas"])
 
-    default_patterns = (
-        r"^\s*Profesor(?:a)?\s*:\s*(.+)$\n"
-        r"^\s*Docente\s*:\s*(.+)$\n"
-        r"^\s*Plan\s+de\s+clase"
-    )
+    # Patrones para detectar inicio de cada “plan”
+    default_patterns = "\n".join([
+        r"^\s*plan\s+de\s+clase",              # ejemplo de encabezado común
+        r"^\s*profesor(?:a)?\s*:\s*(.+)$",     # si justo aquí aparece un nombre
+        r"^\s*docente\s*:\s*(.+)$"
+    ])
     patterns_text = st.text_area(
-        "Patrones (uno por línea, usa paréntesis de captura para el nombre)",
-        value=default_patterns if mode == "Por patrones de texto" else "",
-        height=110,
-        help="Ejemplos:\n"
-             r"^\s*Profesor\s*:\s*(.+)$"
-             "\n"
-             r"^\s*Docente\s*:\s*(.+)$"
-             "\n"
-             r"^\s*Plan\s+de\s+clase"
+        "Patrones de INICIO (uno por línea; opcionalmente con (.+) para capturar).",
+        value=default_patterns if mode == "Por patrones de inicio" else "",
+        height=110
     )
-
     header_lines = st.number_input(
-        "Líneas a leer por página (para detectar encabezado)",
-        min_value=0, max_value=50, value=8, step=1,
-        help="Leer solo las primeras líneas suele ser suficiente y más robusto."
+        "Líneas a leer por página (INICIO)",
+        min_value=0, max_value=120, value=10, step=1
     )
 
     n_pages = st.number_input(
@@ -237,11 +256,13 @@ with st.sidebar:
         min_value=1, max_value=20, value=2, step=1
     )
 
-    prefix = st.text_input(
-        "Prefijo para nombres de archivo (opcional)",
-        value="",
-        help="Ej: '2025_Profesores_'. Deja vacío si no lo necesitas."
-    )
+    st.markdown("---")
+    st.subheader("📛 Búsqueda del nombre")
+    st.write("Se buscará **exactamente** la línea `NOMBRE DEL PROFESOR(A): ...` en las primeras páginas de cada sección.")
+    scan_pages = st.number_input("Páginas a escanear por sección", 1, 10, 2, 1)
+    lines_for_name = st.number_input("Líneas a leer por página (para nombre)", 5, 120, 60, 5)
+
+    prefix = st.text_input("Prefijo para archivos (opcional)", value="")
 
 file = st.file_uploader("Sube tu PDF", type=["pdf"])
 
@@ -251,76 +272,78 @@ if file is not None:
     total_pages = len(reader.pages)
     st.info(f"PDF cargado: **{file.name}** — {total_pages} páginas")
 
-    if st.button("🔍 Previsualizar detecciones" if mode == "Por patrones de texto" else "🔍 Previsualizar bloques"):
-        if mode == "Por patrones de texto":
+    if st.button("🔍 Previsualizar cortes"):
+        if mode == "Por patrones de inicio":
             if not patterns_text.strip():
-                st.error("Agrega al menos un patrón.")
+                st.error("Agrega al menos un patrón o usa 'Cada N páginas'.")
             else:
-                patterns = [p for p in patterns_text.splitlines() if p.strip()]
-                texts = get_page_texts(pdf_bytes, header_lines=header_lines)
-                starts = detect_starts_by_patterns(texts, patterns)
+                patterns = [p for p in (patterns_text.splitlines()) if p.strip()]
+                page_texts = get_page_texts_for_start(pdf_bytes, header_lines)
+                starts = detect_starts_by_patterns(page_texts, patterns)
                 if not starts:
-                    st.warning("No se detectaron inicios. Ajusta patrones y prueba otra vez.")
+                    st.warning("No se detectaron INICIOS. Ajusta patrones o usa 'Cada N páginas'.")
                 else:
                     ranges = build_ranges_from_starts(total_pages, starts)
-                    st.success(f"Detectados {len(ranges)} planes/secciones.")
-                    st.dataframe(
-                        {
-                            "Inicio (página 1-based)": [a+1 for a, _ in starts],
-                            "Etiqueta": [b for _, b in starts],
-                            "Fin (página 1-based)": [r[1] for r in ranges],
-                        }
-                    )
+                    st.success(f"Detectados {len(ranges)} cortes/secciones.")
+                    st.dataframe({
+                        "Inicio (pág. 1-based)": [s[0] + 1 for s in starts],
+                        "Fin (pág. 1-based)": [r[1] for r in ranges],
+                        "Etiqueta capturada": [s[1] or "" for s in starts],
+                    })
         else:
             ranges = build_ranges_every_n(total_pages, n_pages)
-            st.success(f"Se crearían {len(ranges)} archivos (bloques de {n_pages} pág.).")
-            st.dataframe(
-                {
-                    "Inicio (página 1-based)": [r[0] + 1 for r in ranges],
-                    "Fin (página 1-based)": [r[1] for r in ranges],
-                    "Etiqueta": [r[2] for r in ranges],
-                }
-            )
+            st.success(f"Se crearían {len(ranges)} archivos de {n_pages} páginas (último puede variar).")
+            st.dataframe({
+                "Inicio (pág. 1-based)": [r[0] + 1 for r in ranges],
+                "Fin (pág. 1-based)": [r[1] for r in ranges],
+                "Etiqueta capturada": [r[2] or "" for r in ranges],
+            })
 
     st.divider()
 
-    if st.button("✂️ Dividir y descargar ZIP"):
-        if mode == "Por patrones de texto":
-            patterns = [p for p in patterns_text.splitlines() if p.strip()]
-            texts = get_page_texts(pdf_bytes, header_lines=header_lines)
-            starts = detect_starts_by_patterns(texts, patterns)
+    if st.button("✂️ Dividir, nombrar y descargar"):
+        # Construir los rangos según el modo
+        if mode == "Por patrones de inicio":
+            patterns = [p for p in (patterns_text.splitlines()) if p.strip()]
+            if not patterns:
+                st.error("Agrega patrones o usa 'Cada N páginas'.")
+                st.stop()
+            page_texts = get_page_texts_for_start(pdf_bytes, header_lines)
+            starts = detect_starts_by_patterns(page_texts, patterns)
             if not starts:
-                st.error("No se detectaron inicios. Ajusta patrones o usa el modo 'Cada N páginas'.")
-            else:
-                ranges = build_ranges_from_starts(total_pages, starts)
-                zip_bytes = export_ranges_to_zip(pdf_bytes, ranges, prefix=prefix)
-                st.success(f"Listo: {len(ranges)} archivos generados.")
-                st.download_button(
-                    "⬇️ Descargar ZIP",
-                    data=zip_bytes,
-                    file_name=f"{Path(file.name).stem}_split.zip",
-                    mime="application/zip",
-                )
+                st.error("No se detectaron INICIOS. Revisa los patrones.")
+                st.stop()
+            ranges = build_ranges_from_starts(total_pages, starts)
         else:
             ranges = build_ranges_every_n(total_pages, n_pages)
-            zip_bytes = export_ranges_to_zip(pdf_bytes, ranges, prefix=prefix)
-            st.success(f"Listo: {len(ranges)} archivos generados (bloques de {n_pages} páginas).")
-            st.download_button(
-                "⬇️ Descargar ZIP",
-                data=zip_bytes,
-                file_name=f"{Path(file.name).stem}_cada_{n_pages}pag.zip",
-                mime="application/zip",
-            )
+
+        # Exportar ZIP y Excel
+        zip_bytes, excel_bytes, detalles_rows = export_zip_and_excel(
+            pdf_bytes, ranges, prefix=prefix,
+            scan_pages=scan_pages, lines_per_page=lines_for_name
+        )
+
+        st.success(f"¡Listo! Generados {len(detalles_rows)} PDFs.")
+        st.download_button(
+            "⬇️ Descargar ZIP de PDFs",
+            data=zip_bytes,
+            file_name=f"{Path(file.name).stem}_split.zip",
+            mime="application/zip"
+        )
+        st.download_button(
+            "⬇️ Descargar Excel (detalles y resumen)",
+            data=excel_bytes,
+            file_name=f"{Path(file.name).stem}_reporte.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
 st.markdown("---")
-with st.expander("❓ Consejos / Problemas comunes"):
+with st.expander("❓ Consejos si no encuentra el nombre"):
     st.markdown(
         """
-- Si **no detecta** inicios por patrones, abre el PDF y copia 2–3 líneas del encabezado real. Ajusta tus regex; por ejemplo:
-  - `^\\s*Profesor\\s*:\\s*(.+)$`
-  - `^\\s*Docente\\s*:\\s*(.+)$`
-  - `^\\s*Plan\\s+de\\s+.*`
-- Si el PDF es **escaneado** (imágenes), este método no verá texto. Para usar patrones, primero conviértelo con OCR en tu PC (ver README).
-- Puedes bajar el número de **líneas a leer** si hay ruido, o subirlo si el encabezado no entra.
+- Aumenta **“Páginas a escanear”** a 3–4 y **“Líneas a leer por página (para nombre)”** a 80–100.
+- Verifica que **literalmente** exista la línea: `NOMBRE DEL PROFESOR(A): Juan Pérez` en la primera página del plan.
+- Si el PDF es escaneado (imágenes), necesitas hacer **OCR** local antes de subirlo.
+- Si tu encabezado de inicio no tiene un patrón claro, usa el modo **“Cada N páginas”** y deja el nombre al detector.
 """
     )
