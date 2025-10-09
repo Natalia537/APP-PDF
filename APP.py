@@ -78,7 +78,6 @@ def detect_starts_by_patterns(page_texts: List[str], patterns: List[str]) -> Lis
     for i, txt in enumerate(page_texts):
         found_label = None
         for rx in regexes:
-            # buscar por líneas para que ^ y $ sean útiles
             matched = False
             for line in txt.split("\n"):
                 m = rx.search(line)
@@ -111,7 +110,7 @@ def build_ranges_every_n(total_pages: int, n: int) -> List[Tuple[int, int, Optio
         i = end
     return ranges
 
-# ============ Búsqueda específica del nombre ============
+# ============ Búsqueda específica del NOMBRE ============
 def find_prof_name_in_section(pdf_bytes: bytes, start_page: int, end_page: int,
                               scan_pages: int = 2, lines_per_page: int = 60) -> Optional[str]:
     """
@@ -133,31 +132,62 @@ def find_prof_name_in_section(pdf_bytes: bytes, start_page: int, end_page: int,
                 m = label_rx.search(raw)
                 if m and m.group(1).strip():
                     name = m.group(1).strip()
-                    # cortar antes de "GÉNERO" si viene en la misma línea
                     name = cut_before_genero(name)
                     name = clean_title_prefixes(name)
                     name = sanitize_filename(name)
                     return name if name else None
     return None
 
+# ============ Búsqueda de LAA/DESCARGA ============
+def find_laa_descarga_in_section(pdf_bytes: bytes, start_page: int, end_page: int,
+                                 scan_pages: int = 2, lines_per_page: int = 60) -> Optional[str]:
+    """
+    Busca la línea 'LAA/DESCARGA : <numero>' (admite : - – — = como separadores).
+    Devuelve el valor (string) que viene después del separador (con signos/espacios).
+    Si no lo encuentra, devuelve None.
+    """
+    rx = re.compile(r"^\s*LAA/DESCARGA\s*[:=\-\u2014\u2013]\s*(.+)$", re.IGNORECASE)
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        stop = min(end_page, start_page + scan_pages)
+        for p in range(start_page, stop):
+            txt = pdf.pages[p].extract_text() or ""
+            for raw in (txt.splitlines()[:lines_per_page]):
+                m = rx.search(raw)
+                if m and m.group(1).strip():
+                    return m.group(1).strip()
+    return None
+
+def is_negative_number_string(s: str) -> bool:
+    """
+    Determina si el string representa un número NEGATIVO
+    (guion '-' justo antes de los dígitos).
+    Soporta espacios finos: '- 123' también cuenta como negativo.
+    """
+    if not s:
+        return False
+    # quitar separadores de miles comunes (espacios, comas) para evaluar
+    s_compact = re.sub(r"[ ,\u00A0]", "", s)
+    return bool(re.match(r"^-?\d+(\.\d+)?$", s_compact)) and s_compact.startswith("-")
+
 # ============ Excel (openpyxl) ============
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
-def build_excel_bytes(detalles_rows: List[dict]) -> bytes:
-    """Crea un Excel con hojas 'detalles' y 'resumen' usando openpyxl (sin pandas/numpy)."""
+def build_excel_bytes(detalles_rows: List[dict], errores_rows: List[dict]) -> bytes:
+    """Crea un Excel con hojas 'detalles', 'resumen' y 'errores' (si hay), usando openpyxl."""
     wb = Workbook()
+    # DETALLES
     ws_det = wb.active
     ws_det.title = "detalles"
-
     headers = ["orden", "archivo", "nombre_detectado", "pagina_inicio_1based", "pagina_fin_1based", "paginas_en_pdf"]
     ws_det.append(headers)
     for row in detalles_rows:
         ws_det.append([row.get(h) for h in headers])
-
     for col_idx, h in enumerate(headers, 1):
         ws_det.column_dimensions[get_column_letter(col_idx)].width = max(16, len(h) + 2)
 
+    # RESUMEN
     ws_res = wb.create_sheet("resumen")
     ws_res.append(["nombre_detectado", "cantidad_pdfs"])
     counts = {}
@@ -168,6 +198,16 @@ def build_excel_bytes(detalles_rows: List[dict]) -> bytes:
         ws_res.append([name, qty])
     ws_res.column_dimensions["A"].width = 40
     ws_res.column_dimensions["B"].width = 16
+
+    # ERRORES
+    if errores_rows:
+        ws_err = wb.create_sheet("errores")
+        err_headers = ["orden", "nombre_detectado", "valor_laa_descarga", "motivo", "pagina_inicio_1based", "pagina_fin_1based", "paginas_en_pdf"]
+        ws_err.append(err_headers)
+        for r in errores_rows:
+            ws_err.append([r.get(k) for k in err_headers])
+        for col_idx, h in enumerate(err_headers, 1):
+            ws_err.column_dimensions[get_column_letter(col_idx)].width = max(18, len(h) + 2)
 
     bio = io.BytesIO()
     wb.save(bio)
@@ -181,34 +221,53 @@ def export_zip_and_excel(
     prefix: str,
     scan_pages: int,
     lines_per_page: int,
-) -> Tuple[bytes, bytes, List[dict]]:
+) -> Tuple[bytes, bytes, List[dict], List[dict]]:
     """
-    Devuelve (zip_bytes, excel_bytes, detalles_rows).
-    El ZIP trae todos los PDFs nombrados; el Excel trae detalles y resumen.
+    Devuelve (zip_bytes, excel_bytes, detalles_rows, errores_rows).
+    - El ZIP trae solo los PDFs válidos.
+    - Excel trae 'detalles', 'resumen' y 'errores' (si hubo).
     - SIN numeración al inicio del nombre del archivo.
     - Si hay colisión de nombres, agrega sufijo _(2), _(3)...
+    - Se excluyen del ZIP las secciones con LAA/DESCARGA NEGATIVO.
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
     detalles_rows = []
+    errores_rows = []
     mem_zip = io.BytesIO()
     used_names: dict[str, int] = {}
 
     with zipfile.ZipFile(mem_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for idx, (start, end, label_opt) in enumerate(ranges, 1):
-            # 1) Intentar con NOMBRE DEL PROFESOR(A):
+            # 1) Detectar nombre
             detected = find_prof_name_in_section(
                 pdf_bytes, start, end, scan_pages=scan_pages, lines_per_page=lines_per_page
             )
-            # 2) Si no, usar etiqueta del inicio si existe
             if not detected and label_opt:
                 detected = sanitize_filename(label_opt)
-            # 3) Fallback final
             if not detected:
                 detected = f"Plan_{idx:03d}"
 
-            base = sanitize_filename(f"{prefix}{detected}") if prefix else sanitize_filename(detected)
+            # 2) Leer LAA/DESCARGA
+            laa_val = find_laa_descarga_in_section(
+                pdf_bytes, start, end, scan_pages=scan_pages, lines_per_page=lines_per_page
+            )
 
-            # Unicidad: si ya existe, agrega sufijo _(2), _(3)...
+            # 3) Validar si negativo
+            if laa_val is not None and is_negative_number_string(laa_val):
+                # Registrar error y NO agregar al ZIP
+                errores_rows.append({
+                    "orden": idx,
+                    "nombre_detectado": detected,
+                    "valor_laa_descarga": laa_val,
+                    "motivo": "LAA/DESCARGA negativo",
+                    "pagina_inicio_1based": start + 1,
+                    "pagina_fin_1based": end,
+                    "paginas_en_pdf": end - start,
+                })
+                continue  # Skip este plan
+
+            # 4) Si pasa validación, escribir PDF
+            base = sanitize_filename(f"{prefix}{detected}") if prefix else sanitize_filename(detected)
             final_name = base
             if final_name in used_names:
                 used_names[final_name] += 1
@@ -216,7 +275,6 @@ def export_zip_and_excel(
             else:
                 used_names[final_name] = 1
 
-            # Escribir el sub-PDF
             writer = PdfWriter()
             for p in range(start, end):
                 writer.add_page(reader.pages[p])
@@ -224,10 +282,9 @@ def export_zip_and_excel(
             writer.write(out_bytes)
             out_bytes.seek(0)
 
-            fname = f"{final_name}.pdf"  # <-- sin numeración
+            fname = f"{final_name}.pdf"
             zf.writestr(fname, out_bytes.read())
 
-            # Registro para Excel
             detalles_rows.append({
                 "orden": idx,
                 "archivo": fname,
@@ -238,13 +295,13 @@ def export_zip_and_excel(
             })
 
     mem_zip.seek(0)
-    excel_bytes = build_excel_bytes(detalles_rows)
-    return mem_zip.getvalue(), excel_bytes, detalles_rows
+    excel_bytes = build_excel_bytes(detalles_rows, errores_rows)
+    return mem_zip.getvalue(), excel_bytes, detalles_rows, errores_rows
 
 # ============ UI ============
 st.set_page_config(page_title="PDF Splitter — Profes y Excel", page_icon="📄")
 st.title("📄 Dividir PDF, nombrar por 'NOMBRE DEL PROFESOR(A):' y generar Excel")
-st.caption("Corta nombres antes de 'GÉNERO'. Sin numeración en el nombre del archivo.")
+st.caption("Corta nombres antes de 'GÉNERO'. Filtra 'LAA/DESCARGA' negativo. Descargas simultáneas.")
 
 with st.sidebar:
     st.header("⚙️ Configuración")
@@ -272,14 +329,32 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.subheader("📛 Búsqueda del nombre")
-    st.write("Se busca **exactamente** la línea `NOMBRE DEL PROFESOR(A): ...` en las primeras páginas de cada sección y se corta antes de 'GÉNERO'.")
+    st.subheader("📛 Búsqueda del nombre / LAA")
+    st.write("Se busca **exactamente** `NOMBRE DEL PROFESOR(A): ...` y `LAA/DESCARGA: ...` en las primeras páginas de cada sección.")
     scan_pages = st.number_input("Páginas a escanear por sección", 1, 10, 2, 1)
-    lines_for_name = st.number_input("Líneas a leer por página (para nombre)", 5, 120, 60, 5)
+    lines_for_name = st.number_input("Líneas a leer por página (para nombre/LAA)", 5, 120, 60, 5)
 
     prefix = st.text_input("Prefijo para archivos (opcional)", value="")
 
 file = st.file_uploader("Sube tu PDF", type=["pdf"])
+
+# Mostrar botones de descarga si ya se generaron (sin recalcular)
+if "zip_bytes" in st.session_state and "excel_bytes" in st.session_state:
+    st.success("Archivos listos para descargar (sin recalcular).")
+    st.download_button(
+        "⬇️ Descargar ZIP de PDFs",
+        data=st.session_state["zip_bytes"],
+        file_name=st.session_state.get("zip_name", "planes_split.zip"),
+        mime="application/zip",
+        key="dl_zip_ready"
+    )
+    st.download_button(
+        "⬇️ Descargar Excel (detalles, resumen, errores)",
+        data=st.session_state["excel_bytes"],
+        file_name=st.session_state.get("excel_name", "reporte.xlsx"),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_excel_ready"
+    )
 
 if file is not None:
     pdf_bytes = file.read()
@@ -316,7 +391,7 @@ if file is not None:
 
     st.divider()
 
-    if st.button("✂️ Dividir, nombrar y descargar"):
+    if st.button("✂️ Dividir, validar, nombrar y preparar descargas"):
         # Construir los rangos según el modo
         if mode == "Por patrones de inicio":
             patterns = [p for p in (patterns_text.splitlines()) if p.strip()]
@@ -332,32 +407,52 @@ if file is not None:
         else:
             ranges = build_ranges_every_n(total_pages, n_pages)
 
-        # Exportar ZIP y Excel (sin numeración en archivo, y cortando antes de GÉNERO)
-        zip_bytes, excel_bytes, detalles_rows = export_zip_and_excel(
+        # Exportar
+        zip_bytes, excel_bytes, detalles_rows, errores_rows = export_zip_and_excel(
             pdf_bytes, ranges, prefix=prefix,
             scan_pages=scan_pages, lines_per_page=lines_for_name
         )
 
-        st.success(f"¡Listo! Generados {len(detalles_rows)} PDFs.")
+        # Guardar en sesión para descargas simultáneas
+        st.session_state["zip_bytes"] = zip_bytes
+        st.session_state["excel_bytes"] = excel_bytes
+        st.session_state["zip_name"] = f"{Path(file.name).stem}_split.zip"
+        st.session_state["excel_name"] = f"{Path(file.name).stem}_reporte.xlsx"
+
+        # Mensajes y tablas
+        st.success(f"¡Listo! Generados {len(detalles_rows)} PDFs válidos."
+                   + (f" Se excluyeron {len(errores_rows)} por LAA/DESCARGA negativo." if errores_rows else ""))
+
+        # Botones (ambos ya disponibles)
         st.download_button(
             "⬇️ Descargar ZIP de PDFs",
             data=zip_bytes,
-            file_name=f"{Path(file.name).stem}_split.zip",
-            mime="application/zip"
+            file_name=st.session_state["zip_name"],
+            mime="application/zip",
+            key="dl_zip_now"
         )
         st.download_button(
-            "⬇️ Descargar Excel (detalles y resumen)",
+            "⬇️ Descargar Excel (detalles, resumen, errores)",
             data=excel_bytes,
-            file_name=f"{Path(file.name).stem}_reporte.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            file_name=st.session_state["excel_name"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_excel_now"
         )
+
+        # Mostrar errores (si hubo)
+        if errores_rows:
+            st.warning("Los errores encontrados (excluidos del ZIP) por LAA/DESCARGA negativo:")
+            import pandas as pd  # solo para mostrar tabla (no se usa en requirements)
+            st.dataframe(pd.DataFrame(errores_rows))
+        else:
+            st.info("No se encontraron errores de LAA/DESCARGA negativa.")
 
 st.markdown("---")
 with st.expander("❓ Tips"):
     st.markdown(
         """
-- Si el nombre aparece más abajo, sube **“Páginas a escanear”** (3–4) o **“Líneas para nombre”** (80–100).
-- Acepta `GÉNERO` o `GENERO` con o sin acento, mayús/minús.
-- Si hay nombres repetidos, el ZIP agrega `_(2)`, `_(3)` para no sobrescribir.
+- Si el nombre aparece más abajo, sube **“Páginas a escanear”** (3–4) o **“Líneas para nombre/LAA”** (80–100).
+- Se aceptan separadores `:`, `-`, `–`, `—`, `=` en las etiquetas.
+- El ZIP agrega `_(2)`, `_(3)` si hay archivos con nombres repetidos.
 """
     )
